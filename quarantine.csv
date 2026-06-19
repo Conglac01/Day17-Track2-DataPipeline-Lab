@@ -1,0 +1,4 @@
+order_id,user_id,product,amount,status,created_at
+8,,gadget,49.50,completed,2026-06-04
+9,u106,widget,-3.00,completed,2026-06-05
+10,u107,gizmo,12.25,banana,2026-06-05

@@ -1,0 +1,2 @@
+{"trace_id": "t0001", "input": "Can I return a widget I bought 10 days ago?", "reference": "Yes. Widgets can be returned within 30 days for a full refund, so a 10-day-old widget qualifies."}
+{"trace_id": "t0002", "input": "What warranty does a gadget have?", "reference": "Gadgets carry a 90-day limited warranty covering manufacturing defects."}

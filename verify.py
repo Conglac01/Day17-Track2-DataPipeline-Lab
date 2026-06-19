@@ -7,11 +7,17 @@ import duckdb
 
 from pipeline import config
 from pipeline.streaming import MiniTopic, consume_features
-from pipeline.embed import ingest_docs
+from pipeline.embed import ingest_docs, content_hash
 from pipeline.traces import load_traces, traces_to_bronze
-from pipeline.dataset import build_eval_set, build_preference_pairs, decontaminate
+from pipeline.dataset import (
+    build_eval_set, build_preference_pairs, decontaminate,
+    fuzzy_decontaminate, ngram_overlap,
+)
 from pipeline.features import point_in_time_features, naive_leaky_features
-from pipeline.kg import ingest_docs_to_graph, returnable_products, traverse, vector_foil
+from pipeline.kg import (
+    ingest_docs_to_graph, returnable_products, traverse, vector_foil,
+    extract_triples_llm,
+)
 import main
 
 
@@ -84,6 +90,76 @@ def run() -> bool:
     foil = vector_foil(config.DOCS_DIR, "widget", "hanoi")
     ok &= check("vector foil: no single chunk answers the multi-hop question",
                 foil["single_chunk_answers_it"] is False)
+
+    # ── Extension exercises (ungraded, for depth) ─────────────────────
+
+    # Ext 0: Fuzzy decontamination
+    # A realistic paraphrase attack on exact-match: minimal rewording to evade
+    # literal comparison while keeping the same intent.
+    paraphrase_pairs = [
+        {"prompt": "Can I return a widget I bought 10 days ago?",
+         "chosen": "yes", "rejected": "no"},
+        {"prompt": "Can I return a widget purchased 10 days ago?",
+         "chosen": "yes", "rejected": "no"},
+    ]
+    paraphrase_eval = [
+        {"input": "Can I return a widget I bought 10 days ago?",
+         "reference": "yes"},
+    ]
+    # exact-match: only drops the first
+    ok &= check(
+        "Ext0: exact decontaminate drops literal match only",
+        len(decontaminate(paraphrase_pairs, paraphrase_eval)) == 1,
+    )
+    # fuzzy 13-gram: drops BOTH — the paraphrase ("bought"→"purchased") is caught
+    clean_fuzzy, dropped_ng = fuzzy_decontaminate(
+        paraphrase_pairs, paraphrase_eval, method="ngram", threshold=0.15, n=13,
+    )
+    ok &= check(
+        f"Ext0: fuzzy 13-gram decontaminate catches paraphrase "
+        f"(dropped {len(dropped_ng)} of 2)",
+        len(clean_fuzzy) == 0,
+    )
+
+    # Ext 1: Real embeddings — content hash stability & incremental skip
+    h1 = content_hash("hello  world")
+    h2 = content_hash("hello world")  # whitespace churn ignored
+    ok &= check("Ext1: content hash ignores whitespace churn", h1 == h2)
+    rows_inc = ingest_docs(config.DOCS_DIR)
+    known = {f"{r['doc']}#{r['chunk_id']}": r["content_hash"]
+              for r in rows_inc if r.get("content_hash")}
+    rows_skip = ingest_docs(config.DOCS_DIR, known_hashes=known)
+    skipped = [r for r in rows_skip if r["embedding"] is None]
+    ok &= check(
+        f"Ext1: incremental ingestion skips unchanged chunks "
+        f"({len(skipped)}/{len(rows_skip)})",
+        len(skipped) == len(rows_skip),
+    )
+
+    # Ext 2: LLM KG extraction
+    kg_text = config.DOCS_DIR.joinpath("sample.md").read_text()
+    llm_triples = extract_triples_llm(kg_text, model="mock")
+    ok &= check(
+        f"Ext2: LLM KG extractor returns triples from sample.md "
+        f"({len(llm_triples)} triples)",
+        len(llm_triples) >= 3,
+    )
+
+    # Ext 3: Data contract exists
+    dc_path = config.ROOT / "datacontract.yaml"
+    ok &= check("Ext3: datacontract.yaml exists", dc_path.is_file())
+
+    # Ext 4: Backfill safety — re-run main.py and assert idempotency
+    import subprocess
+    r_ext4 = subprocess.run(
+        [sys.executable, "main.py"],
+        capture_output=True, text=True, timeout=30,
+    )
+    ok &= check(
+        "Ext4: main.py re-run is idempotent (IDEMPOTENT ✓ in output)",
+        "IDEMPOTENT" in r_ext4.stdout,
+    )
+
     return ok
 
 

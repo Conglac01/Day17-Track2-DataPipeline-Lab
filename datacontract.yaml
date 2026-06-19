@@ -1,0 +1,202 @@
+# Open Data Contract Standard (ODCS) v3.0 — orders table
+# https://datacontract.com
+#
+# Wire into CI with:
+#   datacontract test datacontract.yaml
+#
+# This contract enforces what the pipeline's Pandera gate already checks at
+# runtime, PLUS ownership, SLAs, and stakeholder metadata that a schema alone
+# cannot express.  The contract is the shared agreement between the data
+# producer (this pipeline) and every consumer (analytics, ML training, BI).
+
+id: orders-pipeline-v1
+version: 1.0.0
+title: Orders Medallion Pipeline
+description: >
+  Bronze → Silver → Gold pipeline for e-commerce orders.  Bronze is raw,
+  append-only; Silver is typed + deduped; Gold is daily aggregates
+  (completed orders only).  Bad records are quarantined, not dropped silently.
+
+owner: data-engineering
+tenant: track2-day17
+domain: e-commerce
+
+# ── Servers / physical locations ──────────────────────────────────────
+servers:
+  - type: duckdb
+    path: warehouse.duckdb
+    description: Local lakehouse (DuckDB file).  In production this is S3/GCS.
+
+# ── Terms & constraints ───────────────────────────────────────────────
+terms:
+  usage: >
+    Silver and Gold may be used for analytics and model training.
+    Bronze is internal — consumers should read Silver or Gold.
+  limitations: >
+    Data is synthetic seed data for the Day 17 lab.  Not for production use.
+  noticePeriod: P0D
+
+# ── Models (tables) ───────────────────────────────────────────────────
+models:
+
+  # ── Bronze ──────────────────────────────────────────────────────────
+  bronze_orders:
+    description: >
+      Raw orders, append-only.  Never edited.  All columns are varchar to
+      survive upstream schema drift.  Rebuildable from raw CSV.
+    type: table
+    layer: bronze
+    fields:
+      - name: order_id
+        type: varchar
+        required: true
+      - name: user_id
+        type: varchar
+        required: false       # nullable — bad rows have null user_id
+      - name: product
+        type: varchar
+        required: true
+      - name: amount
+        type: varchar
+        required: true        # varchar so negative values don't break extract
+      - name: status
+        type: varchar
+        required: true
+      - name: created_at
+        type: varchar
+        required: true
+    quality:
+      - type: row-count
+        spec:
+          min: 1
+          max: 1000000
+
+  # ── Silver ─────────────────────────────────────────────────────────
+  silver_orders:
+    description: >
+      Clean, typed, deduplicated orders.  One row per unique order_id.
+      THIS is the table consumers should query.  Bad records were quarantined,
+      not silently dropped — see quarantine.csv.
+    type: table
+    layer: silver
+    fields:
+      - name: order_id
+        type: integer
+        required: true
+        primaryKey: true
+        checks:
+          - greater-than: 0
+      - name: user_id
+        type: varchar
+        required: true
+        checks:
+          - min-length: 1
+      - name: product
+        type: varchar
+        required: true
+      - name: amount
+        type: double
+        required: true
+        checks:
+          - greater-than: 0.0
+      - name: status
+        type: varchar
+        required: true
+        enum:
+          - completed
+          - pending
+          - refunded
+          - cancelled
+      - name: created_at
+        type: varchar
+        required: true
+    quality:
+      - type: unique
+        spec:
+          column: order_id
+        description: No duplicate order_id survives dedup.
+      - type: not-null
+        spec:
+          columns: [order_id, user_id, product, amount, status, created_at]
+      - type: custom
+        spec:
+          query: |
+            SELECT count(*) FROM silver_orders WHERE amount <= 0
+          expected: 0
+        description: No negative or zero amounts in Silver.
+
+  # ── Gold ───────────────────────────────────────────────────────────
+  gold_daily_orders:
+    description: >
+      Daily business aggregates.  Completed orders only, grouped by date.
+      Feeds dashboards, ML feature stores, and BI tools.
+    type: table
+    layer: gold
+    fields:
+      - name: order_date
+        type: date
+        required: true
+        primaryKey: true
+      - name: n_orders
+        type: integer
+        required: true
+        checks:
+          - greater-than: 0
+      - name: n_users
+        type: integer
+        required: true
+      - name: revenue
+        type: double
+        required: true
+      - name: avg_order_value
+        type: double
+        required: true
+    quality:
+      - type: unique
+        spec:
+          column: order_date
+      - type: not-null
+        spec:
+          columns: [order_date, n_orders, revenue]
+      - type: custom
+        spec:
+          query: |
+            SELECT count(*) FROM gold_daily_orders
+            WHERE revenue < 0 OR avg_order_value < 0
+          expected: 0
+        description: Revenue and AOV must be non-negative.
+
+# ── Dead-letter queue ─────────────────────────────────────────────────
+quarantine:
+  path: quarantine.csv
+  description: >
+    Records that failed the Pandera gate.  Monitor this file —
+    a spike is the earliest signal of upstream schema drift.
+  quality:
+    - type: custom
+      spec:
+        query: |
+          SELECT count(*) FROM quarantine
+          WHERE status NOT IN ('completed','pending','refunded','cancelled')
+          OR amount <= 0 OR user_id IS NULL
+        expected: ">= 3"
+      description: >
+        At least 3 bad records expected in the seed data
+        (null user_id, negative amount, bad status).
+        In production this threshold would be an alert, not a pass condition.
+
+# ── Service-level objectives ──────────────────────────────────────────
+sla:
+  - property: freshness
+    value: P1D
+    description: >
+      Pipeline runs daily.  Gold must reflect all orders up to T-1.
+  - property: completeness
+    value: ">= 99%"
+    description: >
+      Every order in Bronze must have a corresponding row in Silver or
+      quarantine (no silent drops).
+  - property: uniqueness
+    value: 100%
+    description: >
+      Silver must have zero duplicate order_ids (enforced by row_number dedup).

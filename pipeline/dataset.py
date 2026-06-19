@@ -85,6 +85,71 @@ def decontaminate(pairs: list[dict], eval_set: list[dict]) -> list[dict]:
     return [p for p in pairs if _norm(p["prompt"]) not in held_out]
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Extension 0 — Fuzzy decontamination: n-gram overlap + embedding cosine
+# ═══════════════════════════════════════════════════════════════════════
+
+def _ngrams(text: str, n: int = 13) -> set[str]:
+    """Character n-grams: robust to small rewrites, word-order changes."""
+    t = _norm(text)
+    return {t[i : i + n] for i in range(max(0, len(t) - n + 1))}
+
+
+def ngram_overlap(a: str, b: str, n: int = 13) -> float:
+    """Jaccard similarity on character n-grams. Returns 0.0–1.0."""
+    ga, gb = _ngrams(a, n), _ngrams(b, n)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def fuzzy_decontaminate(
+    pairs: list[dict],
+    eval_set: list[dict],
+    method: str = "ngram",
+    threshold: float = 0.30,
+    n: int = 13,
+) -> tuple[list[dict], list[dict]]:
+    """Drop preference pairs whose prompt is *too similar* to any eval input.
+
+    Two methods (selectable):
+      * ``ngram``  — character 13-gram Jaccard. Fast, language-agnostic.
+      * ``embed``   — cosine on embedding vectors (requires embed_text from embed.py).
+
+    Returns (clean_pairs, dropped_pairs) so you can inspect what was removed.
+    """
+    eval_inputs = [e["input"] for e in eval_set]
+
+    if method == "embed":
+        from pipeline.embed import embed_text as _embed
+
+        def _cosine(a: list[float], b: list[float]) -> float:
+            dot = sum(x * y for x, y in zip(a, b))
+            na = (sum(x * x for x in a)) ** 0.5
+            nb = (sum(y * y for y in b)) ** 0.5
+            return dot / (na * nb) if na and nb else 0.0
+
+        eval_vecs = [_embed(t) for t in eval_inputs]
+        clean, dropped = [], []
+        for p in pairs:
+            pvec = _embed(p["prompt"])
+            if any(_cosine(pvec, ev) >= threshold for ev in eval_vecs):
+                dropped.append(p)
+            else:
+                clean.append(p)
+    else:  # ngram
+        clean, dropped = [], []
+        for p in pairs:
+            if any(
+                ngram_overlap(p["prompt"], ei, n=n) >= threshold for ei in eval_inputs
+            ):
+                dropped.append(p)
+            else:
+                clean.append(p)
+
+    return clean, dropped
+
+
 def write_jsonl(rows: list[dict], path: Path) -> int:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:

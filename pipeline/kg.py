@@ -33,6 +33,100 @@ def _canon(entity: str) -> str:
     return _CANON.get(e, e)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Extension 2 — LLM-based KG extraction (swappable extractor)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def extract_triples_llm(
+    text: str,
+    *,
+    model: str = "mock",
+    api_key: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """Extract (subject, relation, object) triples using an LLM.
+
+    This is the **LLM slot** that replaces ``extract_triples`` in production.
+    The downstream graph code (``build_graph``, ``query``, ``traverse``) is unchanged
+    — only the extractor changes, demonstrating substitutability.
+
+    ``model="mock"`` runs a small local simulation (no API key needed) that exercises
+    the same interface. Pass a real model name + key for production use.
+
+    Prompt design follows the deck's entity-relation extraction pattern:
+    entity resolution happens inside the LLM call by asking for canonical forms.
+    """
+    if model == "mock":
+        # Simulated LLM response — exercises the exact same interface without a key.
+        # In production this body is replaced by an API call (OpenAI, Anthropic, etc.)
+        return _mock_llm_extract(text)
+
+    # Real LLM path (requires an API key)
+    import json as _json
+
+    prompt = (
+        "Extract (subject, relation, object) knowledge triples from the text below.\n"
+        "Rules:\n"
+        "- Canonicalize entities: collapse plurals, strip articles (the/a/an).\n"
+        "- Use relation names: IS_A, SHIPS_FROM, RETURNABLE_WITHIN, HAS_WARRANTY, "
+        "NON_RETURNABLE, HAS_PRICE, BELONGS_TO.\n"
+        "- Output ONLY a JSON array of [subject, relation, object] arrays.\n"
+        "- No extra text, no explanation.\n\n"
+        f"Text:\n{text}\n\nOutput:"
+    )
+
+    # --- Replace the try/except body with the LLM SDK of your choice ---
+    # Example for anthropic / openai:
+    #
+    #   import anthropic
+    #   client = anthropic.Anthropic(api_key=api_key)
+    #   resp = client.messages.create(
+    #       model=model, max_tokens=1024,
+    #       messages=[{"role": "user", "content": prompt}],
+    #   )
+    #   raw = resp.content[0].text
+    #
+    # Example for a local model (Ollama):
+    #
+    #   import requests
+    #   resp = requests.post("http://localhost:11434/api/generate", json={
+    #       "model": model, "prompt": prompt, "stream": False,
+    #   })
+    #   raw = resp.json()["response"]
+    #
+    # For now we fall back to mock — the pipeline shape is the point.
+    try:
+        raise NotImplementedError(
+            "Set model='mock' or wire a real LLM SDK call here."
+        )
+    except NotImplementedError:
+        return _mock_llm_extract(text)
+
+
+def _mock_llm_extract(text: str) -> list[tuple[str, str, str]]:
+    """Simulate an LLM call: call the deterministic extractor + canonicalize output.
+
+    This is a placeholder — in production an LLM would handle far more varied
+    surface forms. The point is to demonstrate the **pipeline shape**:
+    swap the extractor, leave the graph untouched.
+    """
+    raw = extract_triples(text)
+    # Run entity resolution on both subject and object
+    canon: list[tuple[str, str, str]] = []
+    for subj, rel, obj in raw:
+        cs = _canon(subj)
+        co = _canon(obj) if not obj[0].isdigit() and " " not in obj.split("-", 1)[0] else obj
+        canon.append((cs, rel, co))
+    # Dedup: LLM might emit duplicate triples from different sentences
+    seen = set()
+    deduped: list[tuple[str, str, str]] = []
+    for t in canon:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
+
+
 def extract_triples(text: str) -> list[tuple[str, str, str]]:
     """Deterministic (subject, relation, object) extraction. LLM slots in here.
 
